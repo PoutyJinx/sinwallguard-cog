@@ -1,0 +1,23 @@
+{
+  "author": [
+    "Jinx",
+    "NODE-13"
+  ],
+  "install_msg": "Thank you for installing SINWallGuard. Use [p]load sinwallguard, then [p]sinwallguard meme #memes for the recommended meme-channel setup. Use [p]slash sync after loading if you want slash commands immediately.",
+  "name": "SINWallGuard",
+  "short": "SIN Corp wall-of-text containment for meme channels.",
+  "description": "Per-channel word and character limits with SIN Corp lore warnings, strike tracking, and optional short timeouts on repeated violations. Includes hybrid slash/prefix commands.",
+  "tags": [
+    "moderation",
+    "textlimit",
+    "memes",
+    "sin",
+    "wallguard"
+  ],
+  "min_bot_version": "3.5.0",
+  "requirements": [],
+  "hidden": false,
+  "disabled": false,
+  "type": "COG",
+  "end_user_data_statement": "This cog stores per-server channel settings persistently. It does not persistently store end-user message contents or user strike data. Temporary strike counts are kept in memory and are cleared when the cog unloads or the bot restarts."
+}

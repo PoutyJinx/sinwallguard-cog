@@ -26,7 +26,7 @@ Designed for channels where images, GIFs, and short captions are fine, but full 
 Replace `<repo_url>` with your GitHub repository URL.
 
 ```text
-[p]repo add sinwallguard <repo_url>
+[p]repo add sinwallguard https://github.com/PoutyJinx/sinwallguard-cog
 [p]cog install sinwallguard sinwallguard
 [p]load sinwallguard
 ```

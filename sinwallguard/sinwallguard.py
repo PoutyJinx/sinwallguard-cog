@@ -27,6 +27,10 @@ DEFAULT_CHANNEL_SETTINGS: Dict[str, Any] = {
     "warning_delete_after": 45,
 }
 
+DEFAULT_GUILD_SETTINGS: Dict[str, Any] = {
+    "modlog_channel_id": None,
+}
+
 MEME_PRESET: Dict[str, Any] = {
     "enabled": True,
     "word_limit": 30,
@@ -42,12 +46,12 @@ class SINWallGuard(commands.Cog):
     """SIN Corp wall-of-text containment for meme channels."""
 
     __author__ = ["Jinx", "NODE-13"]
-    __version__ = "1.0.0"
+    __version__ = "1.1.0"
 
     def __init__(self, bot: Red) -> None:
         self.bot = bot
         self.config = Config.get_conf(self, identifier=83746190256413, force_registration=True)
-        self.config.register_guild(channels={})
+        self.config.register_guild(channels={}, **DEFAULT_GUILD_SETTINGS)
         # Memory-only strikes: (guild_id, configured_channel_id, user_id) -> {count, last}
         self._strikes: Dict[Tuple[int, int, int], Dict[str, float]] = {}
 
@@ -245,6 +249,123 @@ class SINWallGuard(commands.Cog):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
+        await self._send_modlog(
+            message=message,
+            configured_channel_id=configured_channel_id,
+            settings=settings,
+            word_count=word_count,
+            char_count=char_count,
+            violations=violations,
+            strike_count=strike_count,
+            strike_limit=strike_limit,
+            deleted=deleted,
+            timed_out=timed_out,
+            timeout_failed=timeout_failed,
+        )
+
+    async def _send_modlog(
+        self,
+        message: discord.Message,
+        configured_channel_id: int,
+        settings: Dict[str, Any],
+        word_count: int,
+        char_count: int,
+        violations: Dict[str, Tuple[int, int]],
+        strike_count: int,
+        strike_limit: int,
+        deleted: bool,
+        timed_out: bool,
+        timeout_failed: bool,
+    ) -> None:
+        if message.guild is None:
+            return
+
+        modlog_channel_id = await self.config.guild(message.guild).modlog_channel_id()
+        if not modlog_channel_id:
+            return
+
+        channel = message.guild.get_channel(int(modlog_channel_id))
+        if channel is None:
+            try:
+                fetched = await self.bot.fetch_channel(int(modlog_channel_id))
+            except (discord.Forbidden, discord.HTTPException, ValueError):
+                return
+            if not isinstance(fetched, discord.TextChannel):
+                return
+            channel = fetched
+
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        source_channel = message.channel
+        configured_channel = message.guild.get_channel(configured_channel_id)
+        configured_name = configured_channel.mention if configured_channel else f"`{configured_channel_id}`"
+        source_name = getattr(source_channel, "mention", f"`{source_channel.id}`")
+
+        violation_text = ", ".join(
+            f"{label}: {actual}/{limit}" for label, (actual, limit) in violations.items()
+        )
+        action_bits = ["deleted" if deleted else "delete failed"]
+        if timed_out:
+            action_bits.append(f"timed out for {self._human_duration(int(settings.get('timeout_seconds', 60)))}")
+        elif timeout_failed:
+            action_bits.append("timeout failed")
+
+        created_at = discord.utils.format_dt(message.created_at, style="F")
+        jump_url = getattr(message, "jump_url", None)
+        jump_line = f"\nJump URL: {jump_url}" if jump_url else ""
+
+        header = (
+            "**SINWallGuard Mod Log**\n"
+            f"User: {message.author.mention} (`{message.author.id}`)\n"
+            f"Channel: {source_name} | Config: {configured_name}\n"
+            f"When: {created_at}\n"
+            f"Action: **{', '.join(action_bits)}**\n"
+            f"Strikes: **{min(strike_count, strike_limit)}/{strike_limit}**\n"
+            f"Detected: **{word_count} words** / **{char_count} characters**\n"
+            f"Violation: **{violation_text}**"
+            f"{jump_line}\n"
+            "Deleted text:"
+        )
+
+        try:
+            await channel.send(
+                header,
+                allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
+            )
+            for chunk in self._codeblock_chunks(message.content):
+                await channel.send(
+                    chunk,
+                    allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
+                )
+
+            if message.attachments:
+                attachment_lines = [
+                    f"• {attachment.filename}: {attachment.url}" for attachment in message.attachments
+                ]
+                await channel.send(
+                    "Attachments on deleted message:\n" + "\n".join(attachment_lines),
+                    allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            return
+
+    def _codeblock_chunks(self, content: str):
+        # Discord bot messages are capped, and code fences need room too.
+        # Splitting keeps the mod log from failing on giant text walls.
+        safe_content = content.replace("```", "`\u200b``")
+        max_body_length = 1850
+        if not safe_content:
+            yield "```text\n[empty message content]\n```"
+            return
+
+        start = 0
+        total_length = len(safe_content)
+        while start < total_length:
+            chunk = safe_content[start : start + max_body_length]
+            start += max_body_length
+            yield f"```text\n{chunk}\n```"
+
     def _add_strike(
         self,
         guild_id: int,
@@ -429,6 +550,8 @@ class SINWallGuard(commands.Cog):
             f"`{prefix}sinwallguard chars #memes 250`\n"
             f"`{prefix}sinwallguard strikes #memes 3 60`\n"
             f"`{prefix}sinwallguard resettime #memes 10`\n"
+            f"`{prefix}sinwallguard logchannel #mod-log`\n"
+            f"`{prefix}sinwallguard clearlog`\n"
             f"`{prefix}sinwallguard view #memes`\n"
             f"`{prefix}sinwallguard disable #memes`\n\n"
             "Slash versions are available under `/sinwallguard` after syncing."
@@ -604,6 +727,33 @@ class SINWallGuard(commands.Cog):
             f"**Warning cleanup updated for {channel.mention}.**\n{self._settings_summary(settings)}"
         )
 
+    @sinwallguard.command(name="logchannel")
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    async def sinwallguard_logchannel(
+        self, ctx: commands.Context, channel: discord.TextChannel
+    ) -> None:
+        """Set the moderator log channel."""
+        permissions = channel.permissions_for(ctx.guild.me)
+        warning = ""
+        if not permissions.send_messages:
+            warning = "\n⚠️ I do not currently have **Send Messages** in that channel."
+
+        await self.config.guild(ctx.guild).modlog_channel_id.set(channel.id)
+        await ctx.send(
+            f"**SINWallGuard mod log channel set to {channel.mention}.**\n"
+            "Deleted wall-text will be copied there in safe code-block chunks."
+            f"{warning}"
+        )
+
+    @sinwallguard.command(name="clearlog")
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    async def sinwallguard_clearlog(self, ctx: commands.Context) -> None:
+        """Disable the moderator log channel."""
+        await self.config.guild(ctx.guild).modlog_channel_id.clear()
+        await ctx.send("**SINWallGuard mod logging disabled.** The paperwork chute has been sealed.")
+
     @sinwallguard.command(name="view")
     @commands.guild_only()
     @checks.mod_or_permissions(manage_messages=True)
@@ -617,7 +767,14 @@ class SINWallGuard(commands.Cog):
             return
 
         settings = await self._get_channel_settings(ctx.guild, channel.id)
-        await ctx.send(f"**SINWallGuard settings for {channel.mention}:**\n{self._settings_summary(settings)}")
+        modlog_channel_id = await self.config.guild(ctx.guild).modlog_channel_id()
+        modlog_channel = ctx.guild.get_channel(int(modlog_channel_id)) if modlog_channel_id else None
+        modlog_text = modlog_channel.mention if modlog_channel else ("disabled" if not modlog_channel_id else f"missing channel `{modlog_channel_id}`")
+        await ctx.send(
+            f"**SINWallGuard settings for {channel.mention}:**\n"
+            f"{self._settings_summary(settings)}\n"
+            f"Mod log: **{modlog_text}**"
+        )
 
     @sinwallguard.command(name="list")
     @commands.guild_only()

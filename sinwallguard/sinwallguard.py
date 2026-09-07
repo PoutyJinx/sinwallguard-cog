@@ -4,7 +4,7 @@ import datetime
 import io
 import re
 import time
-from typing import Any, Dict, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import discord
 from redbot.core import Config, checks, commands
@@ -25,6 +25,9 @@ DEFAULT_CHANNEL_SETTINGS: Dict[str, Any] = {
     "timeout_seconds": 60,
     "reset_after_minutes": 10,
     "warning_delete_after": 45,
+    "thread_redirect_enabled": False,
+    "thread_auto_archive_minutes": 1440,
+    "thread_repost_deleted": True,
 }
 
 DEFAULT_GUILD_SETTINGS: Dict[str, Any] = {
@@ -39,6 +42,9 @@ MEME_PRESET: Dict[str, Any] = {
     "timeout_seconds": 60,
     "reset_after_minutes": 10,
     "warning_delete_after": 45,
+    "thread_redirect_enabled": True,
+    "thread_auto_archive_minutes": 1440,
+    "thread_repost_deleted": True,
 }
 
 
@@ -46,7 +52,7 @@ class SINWallGuard(commands.Cog):
     """SIN Corp wall-of-text containment for meme channels."""
 
     __author__ = ["Jinx", "NODE-13"]
-    __version__ = "1.1.0"
+    __version__ = "1.2.0"
 
     def __init__(self, bot: Red) -> None:
         self.bot = bot
@@ -54,6 +60,8 @@ class SINWallGuard(commands.Cog):
         self.config.register_guild(channels={}, **DEFAULT_GUILD_SETTINGS)
         # Memory-only strikes: (guild_id, configured_channel_id, user_id) -> {count, last}
         self._strikes: Dict[Tuple[int, int, int], Dict[str, float]] = {}
+        # Memory-only active containment threads for reuse.
+        self._active_threads: Dict[Tuple[int, int, int], Dict[str, float]] = {}
 
     def format_help_for_context(self, ctx: commands.Context) -> str:
         pre_processed = super().format_help_for_context(ctx)
@@ -67,6 +75,9 @@ class SINWallGuard(commands.Cog):
         # Remove temporary in-memory strikes for this user, if any exist.
         self._strikes = {
             key: value for key, value in self._strikes.items() if key[2] != user_id
+        }
+        self._active_threads = {
+            key: value for key, value in self._active_threads.items() if key[2] != user_id
         }
 
     # ----------------------------
@@ -96,6 +107,11 @@ class SINWallGuard(commands.Cog):
         except Exception:
             pass
 
+        # Threads are the containment chamber. The main channel stays short, but
+        # discussion inside threads is not limited by SINWallGuard.
+        if isinstance(message.channel, discord.Thread):
+            return
+
         configured_channel_id, settings = await self._settings_for_message(message)
         if not configured_channel_id or not settings:
             return
@@ -124,7 +140,8 @@ class SINWallGuard(commands.Cog):
         channel_settings = await self.config.guild(guild).channels()
         candidates = [message.channel.id]
 
-        # Threads inherit the parent channel's limit if the thread itself is not configured.
+        # Normal text channels are guarded. Threads are ignored earlier so long
+        # discussions can live in containment without adding strikes.
         parent_id = getattr(message.channel, "parent_id", None)
         if parent_id:
             candidates.append(parent_id)
@@ -240,14 +257,36 @@ class SINWallGuard(commands.Cog):
         if not isinstance(delete_after, int) or delete_after <= 0:
             delete_after = None
 
+        warning_message: Optional[discord.Message] = None
+        created_thread: Optional[discord.Thread] = None
+
         try:
-            await message.channel.send(
+            warning_message = await message.channel.send(
                 notice,
                 allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-                delete_after=delete_after,
+                # If thread redirect is enabled, the warning becomes the thread anchor.
+                # Keeping it avoids creating a ghost thread with no visible parent message.
+                delete_after=None if settings.get("thread_redirect_enabled") else delete_after,
             )
         except (discord.Forbidden, discord.HTTPException):
-            pass
+            warning_message = None
+
+        if warning_message and settings.get("thread_redirect_enabled"):
+            created_thread = await self._create_containment_thread(
+                warning_message=warning_message,
+                original_message=message,
+                configured_channel_id=configured_channel_id,
+                settings=settings,
+                word_count=word_count,
+                char_count=char_count,
+                violations=violations,
+            )
+
+            if created_thread:
+                try:
+                    await warning_message.edit(content=f"{notice}\nThread: {created_thread.mention}")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
 
         await self._send_modlog(
             message=message,
@@ -261,7 +300,130 @@ class SINWallGuard(commands.Cog):
             deleted=deleted,
             timed_out=timed_out,
             timeout_failed=timeout_failed,
+            created_thread=created_thread,
         )
+
+    async def _get_active_thread(
+        self, guild: discord.Guild, key: Tuple[int, int, int]
+    ) -> Optional[discord.Thread]:
+        data = self._active_threads.get(key)
+        if not data:
+            return None
+
+        thread_id = int(data.get("thread_id", 0))
+        if not thread_id:
+            self._active_threads.pop(key, None)
+            return None
+
+        thread = guild.get_thread(thread_id)
+        if thread is None:
+            try:
+                fetched = await self.bot.fetch_channel(thread_id)
+            except (discord.Forbidden, discord.HTTPException, ValueError):
+                self._active_threads.pop(key, None)
+                return None
+            if not isinstance(fetched, discord.Thread):
+                self._active_threads.pop(key, None)
+                return None
+            thread = fetched
+
+        if getattr(thread, "archived", False) or getattr(thread, "locked", False):
+            self._active_threads.pop(key, None)
+            return None
+
+        return thread
+
+    async def _create_containment_thread(
+        self,
+        warning_message: discord.Message,
+        original_message: discord.Message,
+        configured_channel_id: int,
+        settings: Dict[str, Any],
+        word_count: int,
+        char_count: int,
+        violations: Dict[str, Tuple[int, int]],
+    ) -> Optional[discord.Thread]:
+        if not isinstance(warning_message.channel, discord.TextChannel):
+            return None
+
+        archive_minutes = int(settings.get("thread_auto_archive_minutes", 1440) or 1440)
+        if archive_minutes not in {60, 1440, 4320, 10080}:
+            archive_minutes = 1440
+
+        display_name = original_message.author.display_name[:32]
+        safe_name = re.sub(r"[^0-9A-Za-zÀ-ÖØ-öø-ÿ _.-]+", "", display_name).strip() or "Dweller"
+        thread_name = f"SIN Containment: {safe_name}"[:100]
+
+        violation_text = ", ".join(
+            f"{label}: {actual}/{limit}" for label, (actual, limit) in violations.items()
+        )
+
+        key = (original_message.guild.id, configured_channel_id, original_message.author.id)
+        thread = await self._get_active_thread(original_message.guild, key)
+        created_new_thread = thread is None
+
+        if thread is None:
+            try:
+                thread = await warning_message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=archive_minutes,
+                    reason="SINWallGuard thread containment for long message",
+                )
+                self._active_threads[key] = {"thread_id": float(thread.id), "last": time.monotonic()}
+            except (discord.Forbidden, discord.HTTPException):
+                return None
+        else:
+            self._active_threads[key] = {"thread_id": float(thread.id), "last": time.monotonic()}
+
+        try:
+            await thread.add_user(original_message.author)
+        except (discord.Forbidden, discord.HTTPException, AttributeError):
+            # Public threads are still visible from the parent channel; failing to add the
+            # author should not break the containment flow.
+            pass
+
+        if created_new_thread:
+            intro = (
+                f"{original_message.author.mention}, your long message was moved into a SIN Corp containment thread.\n"
+                "Long discussion is allowed here. The main meme channel stays short.\n"
+                f"Detected: **{word_count} words** / **{char_count} characters**. "
+                f"Violation: **{violation_text}**."
+            )
+        else:
+            intro = (
+                f"{original_message.author.mention}, another long main-channel message was redirected here.\n"
+                "This existing containment thread is still open, so the discussion can continue here instead.\n"
+                f"Detected: **{word_count} words** / **{char_count} characters**. "
+                f"Violation: **{violation_text}**."
+            )
+
+        try:
+            await thread.send(
+                intro,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+
+            if settings.get("thread_repost_deleted", True):
+                await thread.send(
+                    "Original deleted text, preserved for discussion:",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                for chunk in self._codeblock_chunks(original_message.content):
+                    await thread.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+
+            if original_message.attachments:
+                attachment_lines = [
+                    f"• {attachment.filename}: {attachment.url}"
+                    for attachment in original_message.attachments
+                ]
+                await thread.send(
+                    "Attachments from the deleted message:\n" + "\n".join(attachment_lines),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        return thread
 
     async def _send_modlog(
         self,
@@ -276,6 +438,7 @@ class SINWallGuard(commands.Cog):
         deleted: bool,
         timed_out: bool,
         timeout_failed: bool,
+        created_thread: Optional[discord.Thread] = None,
     ) -> None:
         if message.guild is None:
             return
@@ -314,6 +477,7 @@ class SINWallGuard(commands.Cog):
         created_at = discord.utils.format_dt(message.created_at, style="F")
         jump_url = getattr(message, "jump_url", None)
         jump_line = f"\nJump URL: {jump_url}" if jump_url else ""
+        thread_line = f"\nThread: {created_thread.mention}" if created_thread else ""
 
         header = (
             "**SINWallGuard Mod Log**\n"
@@ -324,6 +488,7 @@ class SINWallGuard(commands.Cog):
             f"Strikes: **{min(strike_count, strike_limit)}/{strike_limit}**\n"
             f"Detected: **{word_count} words** / **{char_count} characters**\n"
             f"Violation: **{violation_text}**"
+            f"{thread_line}"
             f"{jump_line}\n"
             "Deleted text:"
         )
@@ -413,6 +578,7 @@ class SINWallGuard(commands.Cog):
         limits = self._limit_text(settings)
         timeout_seconds = int(settings.get("timeout_seconds", 60))
         reset_minutes = int(settings.get("reset_after_minutes", 10))
+        thread_hint = "\nUse the containment thread for longer discussion. Messages inside threads are allowed." if settings.get("thread_redirect_enabled") else ""
 
         detected = f"Detected: **{word_count} words** / **{char_count} characters**."
         strike_text = f"Strike **{min(strike_count, strike_limit)}/{strike_limit}**."
@@ -425,6 +591,7 @@ class SINWallGuard(commands.Cog):
                 f"{delete_text}\n"
                 f"You have been placed in a **{self._human_duration(timeout_seconds)} timeout** "
                 f"for the safety of the meme department."
+                f"{thread_hint}"
             )
         elif should_timeout and timeout_failed:
             title = "**SIN Corp Containment Attempt Failed**"
@@ -432,6 +599,7 @@ class SINWallGuard(commands.Cog):
                 f"{member.mention}, you reached the containment threshold, but I could not apply the timeout.\n"
                 f"{delete_text}\n"
                 f"Please check my **Moderate Members** permission and role hierarchy before the toast essays evolve."
+                f"{thread_hint}"
             )
         elif strike_count >= max(1, strike_limit - 1):
             title = "**SIN Corp Final Notice**"
@@ -440,6 +608,7 @@ class SINWallGuard(commands.Cog):
                 f"This channel is for memes, not a doctoral thesis on toast.\n"
                 f"{delete_text}\n"
                 f"One more violation may result in a **{self._human_duration(timeout_seconds)} timeout**."
+                f"{thread_hint}"
             )
         else:
             title = "**SIN Corp Compliance Notice**"
@@ -447,6 +616,7 @@ class SINWallGuard(commands.Cog):
                 f"{member.mention}, your message exceeded the approved meme-channel containment limit.\n"
                 f"{delete_text}\n"
                 f"Please keep posts under **{limits}** so the archives remain readable."
+                f"{thread_hint}"
             )
 
         footer = (
@@ -515,13 +685,17 @@ class SINWallGuard(commands.Cog):
         timeout_seconds = int(settings.get("timeout_seconds", 60))
         warning_delete_after = settings.get("warning_delete_after", 45)
         warning_text = "never" if not warning_delete_after else f"{warning_delete_after}s"
+        thread_enabled = "Enabled" if settings.get("thread_redirect_enabled") else "Disabled"
+        archive_minutes = int(settings.get("thread_auto_archive_minutes", 1440) or 1440)
+        repost_text = "yes" if settings.get("thread_repost_deleted", True) else "no"
         return (
             f"Status: **{enabled}**\n"
             f"Limit: **{self._limit_text(settings)}**\n"
             f"Strikes: **{settings.get('strike_limit', 3)}**\n"
             f"Timeout: **{self._human_duration(timeout_seconds)}**\n"
             f"Strike reset: **{settings.get('reset_after_minutes', 10)} minutes**\n"
-            f"Warning cleanup: **{warning_text}**"
+            f"Warning cleanup: **{warning_text}**\n"
+            f"Thread redirect: **{thread_enabled}** ({archive_minutes} min archive, repost: {repost_text})"
         )
 
     def _validate_limit(self, amount: Optional[int], name: str) -> Optional[str]:
@@ -550,6 +724,7 @@ class SINWallGuard(commands.Cog):
             f"`{prefix}sinwallguard chars #memes 250`\n"
             f"`{prefix}sinwallguard strikes #memes 3 60`\n"
             f"`{prefix}sinwallguard resettime #memes 10`\n"
+            f"`{prefix}sinwallguard threadmode #memes true 1440 true`\n"
             f"`{prefix}sinwallguard logchannel #mod-log`\n"
             f"`{prefix}sinwallguard clearlog`\n"
             f"`{prefix}sinwallguard view #memes`\n"
@@ -725,6 +900,53 @@ class SINWallGuard(commands.Cog):
         )
         await ctx.send(
             f"**Warning cleanup updated for {channel.mention}.**\n{self._settings_summary(settings)}"
+        )
+
+    @sinwallguard.command(name="threadmode")
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    async def sinwallguard_threadmode(
+        self,
+        ctx: commands.Context,
+        channel: discord.TextChannel,
+        enabled: bool = True,
+        auto_archive_minutes: int = 1440,
+        repost_deleted: bool = True,
+    ) -> None:
+        """Enable or disable thread containment for long messages."""
+        if auto_archive_minutes not in {60, 1440, 4320, 10080}:
+            await ctx.send("Auto archive minutes must be one of: 60, 1440, 4320, or 10080.")
+            return
+
+        permissions = channel.permissions_for(ctx.guild.me)
+        warning = ""
+        if enabled:
+            missing = []
+            if not permissions.send_messages:
+                missing.append("Send Messages")
+            if not getattr(permissions, "create_public_threads", False):
+                missing.append("Create Public Threads")
+            if not getattr(permissions, "send_messages_in_threads", False):
+                missing.append("Send Messages in Threads")
+            if missing:
+                warning = "\n⚠️ I may need these permissions in that channel: **" + ", ".join(missing) + "**."
+
+        settings = await self._set_channel_settings(
+            ctx.guild,
+            channel.id,
+            enabled=True,
+            thread_redirect_enabled=enabled,
+            thread_auto_archive_minutes=auto_archive_minutes,
+            thread_repost_deleted=repost_deleted,
+        )
+
+        state = "enabled" if enabled else "disabled"
+        await ctx.send(
+            f"**SINWallGuard thread containment {state} for {channel.mention}.**\n"
+            f"Long main-channel messages will be deleted and redirected into a public thread. "
+            f"Messages inside threads are not limited by SINWallGuard.\n"
+            f"{self._settings_summary(settings)}"
+            f"{warning}"
         )
 
     @sinwallguard.command(name="logchannel")
